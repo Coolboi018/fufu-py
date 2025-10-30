@@ -13,7 +13,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # Spotify setup
 sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
@@ -321,8 +321,8 @@ async def leave(ctx):
     else:
         await ctx.send("I'm not in a voice channel!")
 
-@bot.command()
-async def help(ctx):
+@bot.command(name='commands', aliases=['help', 'h'])
+async def commands_list(ctx):
     """Show help message"""
     embed = discord.Embed(title="🎵 Music Bot Commands", color=discord.Color.green())
     embed.add_field(name="!play <song/url>", value="Play a song from YouTube, Spotify, or search", inline=False)
