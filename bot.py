@@ -6,9 +6,9 @@ import yt_dlp
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 from collections import deque
-import re
 from datetime import datetime, timedelta
 from aiohttp import web
+from urllib.parse import urlparse
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -33,25 +33,24 @@ class MusicPlayer:
 
 music_players = {}
 
+# yt-dlp: get direct audio URLs suitable for FFmpeg
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
-    'extractaudio': True,
-    'audioformat': 'mp3',
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
     'noplaylist': False,
-    'nocheckcertificate': True,
-    'ignoreerrors': False,
+    'nocheckcertificate': False,
+    'ignoreerrors': True,
     'logtostderr': False,
     'quiet': True,
     'no_warnings': True,
-    'default_search': 'auto',
-    'source_address': '0.0.0.0',
-    'extract_flat': 'in_playlist'
+    'default_search': 'ytsearch',
+    'source_address': '0.0.0.0'
+    # IMPORTANT: do NOT set extract_flat; we want direct URLs
 }
 
 FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'before_options': '-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn'
 }
 
@@ -60,8 +59,15 @@ def get_player(guild_id):
         music_players[guild_id] = MusicPlayer()
     return music_players[guild_id]
 
+def is_url(text: str) -> bool:
+    try:
+        parsed = urlparse(text)
+        return parsed.scheme in ('http', 'https') and bool(parsed.netloc)
+    except Exception:
+        return False
+
 def extract_spotify_info(url):
-    """Extract track info from Spotify URL"""
+    """Extract track/playlist/album info from Spotify URL"""
     if 'track' in url:
         track_id = url.split('track/')[1].split('?')[0]
         track = sp.track(track_id)
@@ -75,8 +81,9 @@ def extract_spotify_info(url):
         playlist = sp.playlist(playlist_id)
         tracks = []
         for item in playlist['tracks']['items']:
-            track = item['track']
-            tracks.append(f"{track['artists'][0]['name']} - {track['name']}")
+            t = item['track']
+            if t:  # guard against nulls
+                tracks.append(f"{t['artists'][0]['name']} - {t['name']}")
         return {
             'type': 'playlist',
             'tracks': tracks,
@@ -86,8 +93,8 @@ def extract_spotify_info(url):
         album_id = url.split('album/')[1].split('?')[0]
         album = sp.album(album_id)
         tracks = []
-        for track in album['tracks']['items']:
-            tracks.append(f"{track['artists'][0]['name']} - {track['name']}")
+        for t in album['tracks']['items']:
+            tracks.append(f"{t['artists'][0]['name']} - {t['name']}")
         return {
             'type': 'album',
             'tracks': tracks,
@@ -95,29 +102,42 @@ def extract_spotify_info(url):
         }
     return None
 
-async def search_youtube(query):
-    """Search YouTube for a song"""
+async def search_youtube_first(query):
+    """Return first full entry (not flat) from ytsearch1"""
+    q = f"ytsearch1:{query}"
     with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
         try:
-            info = ydl.extract_info(f"ytsearch:{query}", download=False)
-            if 'entries' in info:
+            info = ydl.extract_info(q, download=False)
+            if 'entries' in info and info['entries']:
                 return info['entries'][0]
-            return info
+            return None
         except Exception as e:
             print(f"Error searching: {e}")
             return None
 
 async def get_audio_source(url_or_query):
-    """Get audio source from URL or search query"""
+    """Get a single playable audio source dict with url/title/webpage_url"""
+    target = url_or_query
+    if not is_url(url_or_query):
+        target = f"ytsearch1:{url_or_query}"
+
     with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
         try:
-            info = ydl.extract_info(url_or_query, download=False)
-            if 'entries' in info:
-                # Playlist
-                return info['entries']
-            url = info['url']
+            info = ydl.extract_info(target, download=False)
+            # For playlists, choose first item
+            if 'entries' in info and info['entries']:
+                info = info['entries'][0]
+
+            # Ensure we have a direct media URL
+            stream_url = info.get('url')
             title = info.get('title', 'Unknown')
-            return {'url': url, 'title': title, 'webpage_url': info.get('webpage_url', url_or_query)}
+            webpage_url = info.get('webpage_url') or info.get('original_url') or url_or_query
+
+            if not stream_url:
+                print("No stream URL found in yt-dlp info")
+                return None
+
+            return {'url': stream_url, 'title': title, 'webpage_url': webpage_url}
         except Exception as e:
             print(f"Error getting audio: {e}")
             return None
@@ -125,35 +145,42 @@ async def get_audio_source(url_or_query):
 def play_next(guild_id):
     """Play next song in queue"""
     player = get_player(guild_id)
-    
+
+    # If looping, re-queue the current track at front
     if player.loop and player.current:
         player.queue.appendleft(player.current)
-    
+
     if not player.queue:
         player.current = None
+        # Do not disconnect immediately; inactivity task will handle it
         return
-    
+
     player.current = player.queue.popleft()
     player.last_activity = datetime.now()
-    
+
     try:
-        source = discord.FFmpegPCMAudio(player.current['url'], **FFMPEG_OPTIONS)
+        # Explicit ffmpeg executable; improves reliability in containers
+        source = discord.FFmpegPCMAudio(
+            player.current['url'],
+            executable='ffmpeg',
+            **FFMPEG_OPTIONS
+        )
         player.voice_client.play(source, after=lambda e: after_song(guild_id, e))
     except Exception as e:
         print(f"Error playing: {e}")
+        # Try the next item rather than looping forever on a bad source
         play_next(guild_id)
 
 def after_song(guild_id, error):
     """Called after a song finishes"""
     if error:
         print(f"Player error: {error}")
-    
-    coro = continue_playback(guild_id)
-    asyncio.run_coroutine_threadsafe(coro, bot.loop)
+    # Schedule on event loop safely
+    bot.loop.create_task(continue_playback(guild_id))
 
 async def continue_playback(guild_id):
     """Continue to next song"""
-    await asyncio.sleep(1)
+    await asyncio.sleep(0.5)
     play_next(guild_id)
 
 @bot.event
@@ -165,83 +192,105 @@ async def on_ready():
 async def check_inactive():
     """Check for inactive voice clients and disconnect"""
     for guild_id, player in list(music_players.items()):
-        if player.voice_client and player.voice_client.is_connected():
-            if datetime.now() - player.last_activity > timedelta(minutes=5):
-                await player.voice_client.disconnect()
+        vc = player.voice_client
+        if vc and vc.is_connected():
+            idle_for = datetime.now() - player.last_activity
+            # Disconnect if idle for > 5 minutes and not playing/paused
+            if idle_for > timedelta(minutes=5) and not (vc.is_playing() or vc.is_paused()):
+                await vc.disconnect()
                 music_players.pop(guild_id, None)
 
 @bot.command()
 async def play(ctx, *, query):
     """Play a song from YouTube, Spotify, or search query"""
-    if not ctx.author.voice:
+    if not ctx.author.voice or not ctx.author.voice.channel:
         await ctx.send("You need to be in a voice channel!")
         return
-    
+
     player = get_player(ctx.guild.id)
-    
-    if not player.voice_client:
+
+    # Connect once and keep the voice client
+    if not player.voice_client or not player.voice_client.is_connected():
         player.voice_client = await ctx.author.voice.channel.connect()
-    
+
     await ctx.send(f"🔍 Searching for: **{query}**")
-    
-    # Check if Spotify URL
+
+    # Spotify handling: resolve to YouTube by title
     if 'spotify.com' in query:
         try:
             spotify_info = extract_spotify_info(query)
+            if not spotify_info:
+                await ctx.send("❌ Could not parse Spotify link.")
+                return
+
             if spotify_info['type'] == 'track':
-                info = await search_youtube(spotify_info['name'])
+                info = await search_youtube_first(spotify_info['name'])
                 if info:
-                    source = await get_audio_source(info['webpage_url'])
-                    player.queue.append(source)
-                    await ctx.send(f"✅ Added to queue: **{source['title']}**")
+                    source = await get_audio_source(info.get('webpage_url') or spotify_info['name'])
+                    if source:
+                        player.queue.append(source)
+                        await ctx.send(f"✅ Added to queue: **{source['title']}**")
+                    else:
+                        await ctx.send("❌ Could not get a playable stream for that track.")
+                else:
+                    await ctx.send("❌ Could not find that track on YouTube.")
             else:
                 # Playlist or album
-                await ctx.send(f"📝 Adding {len(spotify_info['tracks'])} tracks from **{spotify_info['name']}**...")
-                for track_name in spotify_info['tracks']:
-                    info = await search_youtube(track_name)
+                names = spotify_info.get('tracks', [])
+                await ctx.send(f"📝 Adding {len(names)} tracks from **{spotify_info['name']}**...")
+                added = 0
+                for track_name in names:
+                    info = await search_youtube_first(track_name)
                     if info:
-                        source = await get_audio_source(info['webpage_url'])
-                        player.queue.append(source)
-                await ctx.send(f"✅ Added {len(spotify_info['tracks'])} tracks to queue!")
+                        source = await get_audio_source(info.get('webpage_url') or track_name)
+                        if source:
+                            player.queue.append(source)
+                            added += 1
+                await ctx.send(f"✅ Added {added} tracks to queue!")
         except Exception as e:
             await ctx.send(f"❌ Error processing Spotify link: {str(e)}")
             return
-    
-    # Check if YouTube playlist
-    elif 'list=' in query:
+
+    # YouTube playlist URL
+    elif is_url(query) and 'list=' in query:
         try:
             with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
                 playlist_info = ydl.extract_info(query, download=False)
-                if 'entries' in playlist_info:
-                    await ctx.send(f"📝 Adding {len(playlist_info['entries'])} videos from playlist...")
-                    for entry in playlist_info['entries']:
-                        if entry:
-                            source = await get_audio_source(entry['webpage_url'])
-                            if source:
-                                player.queue.append(source)
-                    await ctx.send(f"✅ Added {len(playlist_info['entries'])} videos to queue!")
+            entries = playlist_info.get('entries', []) if playlist_info else []
+            await ctx.send(f"📝 Adding {len(entries)} videos from playlist...")
+            added = 0
+            for entry in entries:
+                if not entry:
+                    continue
+                # Use webpage_url (canonical) to re-extract a playable stream
+                page = entry.get('webpage_url') or entry.get('url')
+                source = await get_audio_source(page)
+                if source:
+                    player.queue.append(source)
+                    added += 1
+            await ctx.send(f"✅ Added {added} videos to queue!")
         except Exception as e:
             await ctx.send(f"❌ Error processing playlist: {str(e)}")
             return
-    
-    # YouTube URL or search query
+
+    # Direct YouTube URL or plain search query
     else:
         source = await get_audio_source(query)
         if source:
             player.queue.append(source)
             await ctx.send(f"✅ Added to queue: **{source['title']}**")
         else:
-            await ctx.send("❌ Could not find the song!")
+            await ctx.send("❌ Could not find a playable stream for that query.")
             return
-    
+
     player.last_activity = datetime.now()
-    
-    if not player.voice_client.is_playing():
+
+    # Start playback if idle
+    if player.voice_client and not (player.voice_client.is_playing() or player.voice_client.is_paused()):
         play_next(ctx.guild.id)
 
 @bot.command()
 async def pause(ctx):
-    """Pause the current song"""
     player = get_player(ctx.guild.id)
     if player.voice_client and player.voice_client.is_playing():
         player.voice_client.pause()
@@ -251,7 +300,6 @@ async def pause(ctx):
 
 @bot.command()
 async def resume(ctx):
-    """Resume the paused song"""
     player = get_player(ctx.guild.id)
     if player.voice_client and player.voice_client.is_paused():
         player.voice_client.resume()
@@ -261,7 +309,6 @@ async def resume(ctx):
 
 @bot.command()
 async def skip(ctx):
-    """Skip the current song"""
     player = get_player(ctx.guild.id)
     if player.voice_client and player.voice_client.is_playing():
         player.voice_client.stop()
@@ -271,7 +318,6 @@ async def skip(ctx):
 
 @bot.command()
 async def stop(ctx):
-    """Stop playing and clear the queue"""
     player = get_player(ctx.guild.id)
     player.queue.clear()
     player.current = None
@@ -281,7 +327,6 @@ async def stop(ctx):
 
 @bot.command()
 async def loop(ctx):
-    """Toggle loop mode"""
     player = get_player(ctx.guild.id)
     player.loop = not player.loop
     status = "enabled" if player.loop else "disabled"
@@ -289,29 +334,27 @@ async def loop(ctx):
 
 @bot.command()
 async def queue(ctx):
-    """Show the current queue"""
     player = get_player(ctx.guild.id)
     if not player.queue and not player.current:
         await ctx.send("Queue is empty!")
         return
-    
+
     embed = discord.Embed(title="🎵 Music Queue", color=discord.Color.blue())
-    
+
     if player.current:
         embed.add_field(name="Now Playing", value=f"**{player.current['title']}**", inline=False)
-    
+
     if player.queue:
         queue_list = '\n'.join([f"{i+1}. {song['title']}" for i, song in enumerate(list(player.queue)[:10])])
         embed.add_field(name=f"Up Next ({len(player.queue)} songs)", value=queue_list, inline=False)
-    
+
     if player.loop:
         embed.set_footer(text="🔁 Loop is enabled")
-    
+
     await ctx.send(embed=embed)
 
 @bot.command()
 async def leave(ctx):
-    """Leave the voice channel"""
     player = get_player(ctx.guild.id)
     if player.voice_client:
         await player.voice_client.disconnect()
@@ -324,7 +367,6 @@ async def leave(ctx):
 
 @bot.command(name='commands', aliases=['help', 'h'])
 async def commands_list(ctx):
-    """Show help message"""
     embed = discord.Embed(title="🎵 Music Bot Commands", color=discord.Color.green())
     embed.add_field(name="!play <song/url>", value="Play a song from YouTube, Spotify, or search", inline=False)
     embed.add_field(name="!pause", value="Pause the current song", inline=False)
@@ -354,7 +396,10 @@ async def start_web_server():
 async def main():
     async with bot:
         await start_web_server()
-        await bot.start(os.getenv('DISCORD_TOKEN'))
+        token = os.getenv('DISCORD_TOKEN')
+        if not token:
+            raise RuntimeError("DISCORD_TOKEN is not set")
+        await bot.start(token)
 
 if __name__ == "__main__":
     asyncio.run(main())
