@@ -137,13 +137,21 @@ def play_next(guild_id):
     
     try:
         source = discord.FFmpegPCMAudio(player.current['url'], **FFMPEG_OPTIONS)
-        player.voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(after_play(guild_id), bot.loop))
+        player.voice_client.play(source, after=lambda e: after_song(guild_id, e))
     except Exception as e:
         print(f"Error playing: {e}")
         play_next(guild_id)
 
-async def after_play(guild_id):
+def after_song(guild_id, error):
     """Called after a song finishes"""
+    if error:
+        print(f"Player error: {error}")
+    
+    coro = continue_playback(guild_id)
+    asyncio.run_coroutine_threadsafe(coro, bot.loop)
+
+async def continue_playback(guild_id):
+    """Continue to next song"""
     await asyncio.sleep(1)
     play_next(guild_id)
 
