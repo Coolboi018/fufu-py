@@ -8,6 +8,7 @@ from spotipy.oauth2 import SpotifyClientCredentials
 from collections import deque
 import re
 from datetime import datetime, timedelta
+from aiohttp import web
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -335,4 +336,25 @@ async def commands_list(ctx):
     embed.add_field(name="!leave", value="Leave voice channel", inline=False)
     await ctx.send(embed=embed)
 
-bot.run(os.getenv('DISCORD_TOKEN'))
+# Web server for Render
+async def handle_health(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_health)
+    app.router.add_get('/health', handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv('PORT', 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Web server started on port {port}")
+
+async def main():
+    async with bot:
+        await start_web_server()
+        await bot.start(os.getenv('DISCORD_TOKEN'))
+
+if __name__ == "__main__":
+    asyncio.run(main())
